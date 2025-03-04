@@ -1,0 +1,77 @@
+#!/bin/bash
+
+# Usage: ./subdomain_recon.sh target.com
+
+domain=$1
+output_dir="recon_$domain"
+mkdir -p $output_dir
+
+# Subdomain Enumeration
+echo "[+] Running Subfinder..."
+subfinder -d $domain -o $output_dir/subfinder.txt
+
+echo "[+] Running ShodanX..."
+shodanx subdomain -d $domain -ra -o $output_dir/shodanx.txt
+
+echo "[+] Running Amass..."
+amass enum -active -norecursive -noalts -d $domain -o $output_dir/amass.txt
+
+echo "[+] Running Gobuster..."
+gobuster dns -d $domain -w /usr/share/wordlists/subdomain_megalist.txt -o $output_dir/gobuster.txt
+
+# Fetch subdomains from various sources
+echo "[+] Fetching from crt.sh..."
+curl -s "https://crt.sh/?q=%.$domain&output=json" | jq -r '.[].name_value' | sed 's/\*\.//g' | sort -u > $output_dir/crtsh.txt
+
+echo "[+] Fetching from AlienVault..."
+curl -s "https://otx.alienvault.com/api/v1/indicators/hostname/$domain/passive_dns" | jq -r '.passive_dns[]?.hostname' | sort -u > $output_dir/alienvault.txt
+
+echo "[+] Fetching from URLScan..."
+curl -s "https://urlscan.io/api/v1/search/?q=domain:$domain&size=10000" | jq -r '.results[]?.page?.domain' | sort -u > $output_dir/urlscan.txt
+
+echo "[+] Fetching from Web Archive..."
+curl -s "http://web.archive.org/cdx/search/cdx?url=*.$domain/*&output=json&collapse=urlkey" | jq -r '.[1:][] | .[2]' | grep -Eo "([a-zA-Z0-9._-]+\.)?$domain" | sort -u > $output_dir/webarchive.txt
+
+# Combine and filter unique subdomains
+cat $output_dir/*.txt | sort -u > $output_dir/all_subdomains.txt
+
+# Live Host Checking
+echo "[+] Checking live hosts with httpx..."
+cat $output_dir/all_subdomains.txt | httpx -td -title -sc -ip > $output_dir/httpx_output.txt
+awk '{print $1}' $output_dir/httpx_output.txt > $output_dir/live_subdomains.txt
+
+# Port Scanning
+echo "[+] Running Naabu..."
+naabu -iL $output_dir/live_subdomains.txt -c 50 -nmap-cli 'nmap -sV -sC' -o $output_dir/ports.txt
+
+# Vulnerability Scanning
+echo "[+] Running Nikto..."
+nikto -h $output_dir/live_subdomains.txt -output $output_dir/nikto_results.txt
+
+echo "[+] Running Nuclei..."
+nuclei -l $output_dir/live_subdomains.txt -rl 10 -bs 2 -c 2 -as -silent -s critical,high,medium -o $output_dir/nuclei_results.txt
+
+# Subdomain Takeover & Broken Link Hijacking
+echo "[+] Checking for subdomain takeovers..."
+subzy run --targets $output_dir/live_subdomains.txt --concurrency 100 --hide_fails --verify_ssl > $output_dir/subzy_results.txt
+
+echo "[+] Checking for broken link hijacking..."
+socialhunter -f $output_dir/live_subdomains.txt > $output_dir/socialhunter_results.txt
+
+# Screenshotting
+echo "[+] Taking screenshots with Eyewitness..."
+eyewitness --web -f $output_dir/live_subdomains.txt --threads 5 -d $output_dir/screenshots
+
+# WAF Detection & Handling
+echo "[+] Identifying WAF-protected subdomains..."
+grep 403 $output_dir/httpx_output.txt > $output_dir/waf_subdomains.txt
+
+echo "[+] Extracting subdomains without WAF..."
+grep -v -i -E 'cloudfront|imperva|cloudflare' $output_dir/httpx_output.txt > $output_dir/nowaf_subdomains.txt
+
+# Directory Fuzzing
+echo "[+] Running Dirsearch on 403 subdomains..."
+awk '{print $1}' $output_dir/waf_subdomains.txt > $output_dir/403_subdomains.txt
+dirsearch -u https://sub.domain.com -x 403,404,500,400,502,503,429 --random-agent
+
+echo "[+] Script completed! Results saved in $output_dir"
